@@ -83,8 +83,8 @@ private:
 
     size_t refSize_;
     size_t selSize_;
-    std::map<int, std::vector<int>> refIdMap_;
-    std::map<int, std::vector<int>> selIdMap_;
+    std::vector<std::vector<int>> refIdMap_;
+    std::vector<std::vector<int>> selIdMap_;
     int nbTotalContact_ = 0;
 };
 
@@ -168,32 +168,34 @@ AnalysisTemplate::initAnalysis(const TrajectoryAnalysisSettings &settings,
     
     // Get the number of residues in both selections
     refSize_ = refsel_.mappedIds().back()+1; // Mapped Ids are zero based thus the +1
-    selSize_ = sel_.mappedIds().back()+1; // Mapped Ids are zero based thus the +
+    selSize_ = sel_.mappedIds().back()+1; // Mapped Ids are zero based thus the +1
 
     for (unsigned int i = 0; i < refSize_; ++i)
     {
-	refIdMap_[i] = std::vector<int>();
+	refIdMap_.push_back(std::vector<int>());
     }
     for (unsigned int i = 0; i < selSize_; ++i)
     {
-	selIdMap_[i] = std::vector<int>();
+	selIdMap_.push_back(std::vector<int>());
     }
 
     for(int i = 0; i < refsel_.posCount(); ++i)
     {
-	refIdMap_[refsel_.mappedIds()[i]].push_back(i);
+	refIdMap_.at(refsel_.mappedIds().at(i)).push_back(i);
     }
+    
     for(int i = 0; i < sel_.posCount(); ++i)
     {
-	selIdMap_[sel_.mappedIds()[i]].push_back(i);
+	selIdMap_.at(sel_.mappedIds().at(i)).push_back(i);
     }
     
     std::clog << "\nReference Selection has " << refIdMap_.size() << " residues.\n";
-    std::clog << "Target Selection has " << selIdMap_.size() << " residues.\n\n";
+    std::clog << "Target Selection has " << selIdMap_.size() << " residues.\n";
     
     // Init the contact count matrix with zeros
     contactMatrix_.resize(refSize_*selSize_);
     std::fill(contactMatrix_.begin(), contactMatrix_.end(), 0);
+    std::clog << "Contact Matrix has " << contactMatrix_.size() << " elements.\n\n";
     
     if (!fnDist_.empty())
     {
@@ -206,7 +208,8 @@ AnalysisTemplate::initAnalysis(const TrajectoryAnalysisSettings &settings,
         data_.addModule(plotm);
     }
 }
-    
+
+
 void
 AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
                                TrajectoryAnalysisModuleData *pdata)
@@ -216,53 +219,57 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     const Selection           &sel = pdata->parallelSelection(sel_);
     
     int nbContactFrame = 0;
-    
     dh.startFrame(frnr, fr.time);
-
+    
     // Lambda function that finds contact between two set of atoms
-    auto distCutoff = [&] (int i, int j) -> bool {
-	for (auto &refAtomId : refIdMap_.at(i) )
-	{
-	    for (auto &selAtomId : selIdMap_.at(j) )
-	    {
-		SelectionPosition p = refsel.position(refAtomId);
-		SelectionPosition q = sel.position(selAtomId);
-		if ( distance2(p.x(), q.x()) < cutoff_ )
-		{
-		    contactMatrix_.at(refSize_*i+j) += 1;
-		    return true;
-		}
-	    } 
-	}
-	return false;
+    auto distCutoff = [&] (int k, int l) -> bool {
+    	for (auto &refAtomId : refIdMap_.at(k) )
+    	{
+    	    for (auto &selAtomId : selIdMap_.at(l) )
+    	    {
+    		SelectionPosition p = refsel.position(refAtomId);
+    		SelectionPosition q = sel.position(selAtomId);
+    		if ( distance2(p.x(), q.x()) < cutoff_ )
+    		{
+    		    contactMatrix_.at(selSize_*k+l) += 1;
+    		    return true;
+    		}
+    	    } 
+    	}
+    	return false;
     };
 
     // Make loop over references residue async to speed up the analysis
     auto asyncCutoff = [&] (int start, int stop) -> int {
-	int count = 0;
-	for (int i = start; i < stop; ++i)
-	{
-	    for (size_t j = 0; j < selIdMap_.size(); ++j)
-	    {
-		if ( distCutoff(i, j) )
-		{
-		    count++;
-		}
-	    }
-	}
-	return count;
+    	int count = 0;
+    	for (int i = start; i < stop; ++i)
+    	{
+    	    for (size_t j = 0; j < selIdMap_.size(); ++j)
+    	    {
+    		if ( distCutoff(i, j) )
+    		{
+    		    count++;
+    		}
+    	    }
+    	}
+    	return count;
     };
     
-    
     // Determine the size of chunks for Async calculation
-    int n = std::thread::hardware_concurrency();
+    unsigned int n = std::thread::hardware_concurrency();
     int chunksize = refSize_ / n;
     std::vector<std::pair<int, int>> startstop;
-    for ( int k = 0; k < n; k++ )
+    int start = 0;
+    for (unsigned int k = 0; k < n; k++ )
     {
-    	startstop.push_back(std::pair<int, int>(k*chunksize, (k+1)*chunksize));
+    	int last = start + chunksize;
+    	if ( refSize_ % n < k )
+    	{
+    	    last -= 1;
+    	}
+    	startstop.push_back(std::pair<int, int>(start, last));
+    	start = last + 1;
     }
-    
     // Launch Futures
     std::vector<std::future<int>> futures{};
     for ( auto& pair : startstop )
@@ -271,14 +278,13 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     				     pair.first,
     				     pair.second));
     }
-    
     // Get result
     for ( auto &fut : futures )
     {
     	nbContactFrame += fut.get();
     }
-    nbTotalContact_ += nbContactFrame;
     
+    nbTotalContact_ += nbContactFrame;
     dh.setPoint(0, nbContactFrame);
     dh.finishFrame();
 }
@@ -304,12 +310,12 @@ AnalysisTemplate::writeOutput()
 		      << selSize_ << " "
 		      << nbTotalContact_ << "\n";
 	
-	for (size_t i = 0; i < refSize_; ++i)
+	for (size_t i = 0; i < refIdMap_.size(); ++i)
 	{ 
-	    for (size_t j = 0; j < selSize_; ++j)
+	    for (size_t j = 0; j < selIdMap_.size(); ++j)
 	    {
 		outputStream_ << std::setw(6)
-			      << contactMatrix_.at(refSize_*i+j) << " "; 
+			      << contactMatrix_.at(selSize_*i+j) << " "; 
 	    }
 	    outputStream_ << "\n";
 	}
