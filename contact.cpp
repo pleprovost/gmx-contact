@@ -39,7 +39,11 @@
 #include <iostream>
 #include <iomanip>
 #include <functional>
+#include <set>
+#include <map>
+#include <utility>
 #include <gromacs/trajectoryanalysis.h>
+#include "gromacs/trajectoryanalysis/topologyinformation.h"
 
 using namespace gmx;
 
@@ -52,12 +56,12 @@ public:
     AnalysisTemplate();
 
     virtual void initOptions(IOptionsContainer          *options,
-			     TrajectoryAnalysisSettings *settings);
+			     TrajectoryAnalysisSettings *settings) override;
     virtual void initAnalysis(const TrajectoryAnalysisSettings &settings,
-			      const TopologyInformation        &top);
-
+			      const TopologyInformation        &top) override;
+    virtual void optionsFinished(gmx::TrajectoryAnalysisSettings *settings) override;
     virtual void analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
-			      TrajectoryAnalysisModuleData *pdata);
+			      TrajectoryAnalysisModuleData *pdata) override;
 
     virtual void finishAnalysis(int nframes);
     virtual void writeOutput();
@@ -66,6 +70,7 @@ private:
     class ModuleData;
 
     std::string                      fnDist_;
+    std::string                      fnMat_;
     double                           cutoff_;
     Selection                        refsel_;
     Selection                        sel_;
@@ -75,10 +80,12 @@ private:
     
     std::vector<int> contactMatrix_;
     std::ofstream outputStream_;
+
     size_t refSize_;
     size_t selSize_;
-
-    int nb_total_contact_ = 0;
+    std::map<int, std::vector<int>> refIdMap_;
+    std::map<int, std::vector<int>> selIdMap_;
+    int nbTotalContact_ = 0;
 };
 
 
@@ -117,9 +124,15 @@ AnalysisTemplate::initOptions(IOptionsContainer          *options,
 		       .store(&fnDist_).defaultBasename("avedist")
 		       .description("Average distances from reference group"));
 
+    options->addOption(FileNameOption("om")
+		       .filetype(eftGenericData).outputFile()
+		       .store(&fnMat_).defaultBasename("contact_matrix")
+		       .description("Contact Count Matrix"));
+    
     options->addOption(SelectionOption("reference")
 		       .store(&refsel_).required()
 		       .description("Reference group to calculate distances from"));
+    
     options->addOption(SelectionOption("select")
 		       .store(&sel_).required()
 		       .description("Group to calculate distances to"));
@@ -130,18 +143,55 @@ AnalysisTemplate::initOptions(IOptionsContainer          *options,
     settings->setFlag(TrajectoryAnalysisSettings::efRequireTop);
 }
 
+void AnalysisTemplate::optionsFinished(TrajectoryAnalysisSettings *settings)
+{
+
+    settings->setFlag(gmx::TrajectoryAnalysisSettings::efRequireTop);
+    settings->setFlag(gmx::TrajectoryAnalysisSettings::efUseTopX);
+
+}
 
 void
 AnalysisTemplate::initAnalysis(const TrajectoryAnalysisSettings &settings,
-                               const TopologyInformation         & /*top*/)
+                               const TopologyInformation         &top)
 {
     data_.setColumnCount(0, 1); 
     avem_.reset(new AnalysisDataAverageModule());
     data_.addModule(avem_);
 
-    refSize_ = refsel_.posCount();
-    selSize_ = sel_.posCount();
+    // Map the Ids to residues number
+    if ( top.hasTopology() )
+    {
+	refsel_.initOriginalIdsToGroup(top.mtop(), INDEX_RES);
+	sel_.initOriginalIdsToGroup(top.mtop(), INDEX_RES);
+    }
+    
+    // Get the number of residues in both selections
+    refSize_ = refsel_.mappedIds().back()+1; // Mapped Ids are zero based thus the +1
+    selSize_ = sel_.mappedIds().back()+1; // Mapped Ids are zero based thus the +
 
+    for (unsigned int i = 0; i < refSize_; ++i)
+    {
+	refIdMap_[i] = std::vector<int>();
+    }
+    for (unsigned int i = 0; i < selSize_; ++i)
+    {
+	selIdMap_[i] = std::vector<int>();
+    }
+
+    for(int i = 0; i < refsel_.posCount(); ++i)
+    {
+	refIdMap_[refsel_.mappedIds()[i]].push_back(i);
+    }
+    for(int i = 0; i < sel_.posCount(); ++i)
+    {
+	selIdMap_[sel_.mappedIds()[i]].push_back(i);
+    }
+    
+    std::clog << "\nReference Selection has " << refIdMap_.size() << " residues.\n";
+    std::clog << "Target Selection has " << selIdMap_.size() << " residues.\n\n";
+    
+    // Init the contact count matrix with zeros
     contactMatrix_.resize(refSize_*selSize_);
     std::fill(contactMatrix_.begin(), contactMatrix_.end(), 0);
     
@@ -156,14 +206,7 @@ AnalysisTemplate::initAnalysis(const TrajectoryAnalysisSettings &settings,
         data_.addModule(plotm);
     }
 }
-
-void contact(int start, int stop, const Selection &ref, const Selection &sel,
-	     std::vector<int> contactMatrix, int& nb_contact)
-{
-
     
-}
-
 void
 AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
                                TrajectoryAnalysisModuleData *pdata)
@@ -172,66 +215,71 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     const Selection           &refsel = pdata->parallelSelection(refsel_);
     const Selection           &sel = pdata->parallelSelection(sel_);
     
+    int nbContactFrame = 0;
+    
     dh.startFrame(frnr, fr.time);
-    int nb_contact = 0;
 
-    auto l = [&] (int start, int stop) -> int {
-	int count=0;
-	for (size_t i = start; i < stop; ++i)
+    // Lambda function that finds contact between two set of atoms
+    auto distCutoff = [&] (int i, int j) -> bool {
+	for (auto &refAtomId : refIdMap_.at(i) )
 	{
-	    for (size_t j = 0; j < selSize_; ++j)
+	    for (auto &selAtomId : selIdMap_.at(j) )
 	    {
-		SelectionPosition p = refsel.position(i);
-		SelectionPosition q = sel.position(j);
-		if ( distance2(p.x(), q.x()) < cutoff_)
+		SelectionPosition p = refsel.position(refAtomId);
+		SelectionPosition q = sel.position(selAtomId);
+		if ( distance2(p.x(), q.x()) < cutoff_ )
 		{
 		    contactMatrix_.at(refSize_*i+j) += 1;
+		    return true;
+		}
+	    } 
+	}
+	return false;
+    };
+
+    // Make loop over references residue async to speed up the analysis
+    auto asyncCutoff = [&] (int start, int stop) -> int {
+	int count = 0;
+	for (int i = start; i < stop; ++i)
+	{
+	    for (size_t j = 0; j < selIdMap_.size(); ++j)
+	    {
+		if ( distCutoff(i, j) )
+		{
 		    count++;
 		}
 	    }
 	}
 	return count;
     };
-
-    std::vector<std::future<int>> futures{};
+    
+    
+    // Determine the size of chunks for Async calculation
     int n = std::thread::hardware_concurrency();
     int chunksize = refSize_ / n;
-    
     std::vector<std::pair<int, int>> startstop;
     for ( int k = 0; k < n; k++ )
     {
-	startstop.push_back(std::pair<int, int>(k*chunksize, (k+1)*chunksize));
+    	startstop.push_back(std::pair<int, int>(k*chunksize, (k+1)*chunksize));
     }
     
     // Launch Futures
+    std::vector<std::future<int>> futures{};
     for ( auto& pair : startstop )
     {
-	futures.push_back(std::async(std::launch::async, l,
-				     pair.first,
-				     pair.second));
+    	futures.push_back(std::async(std::launch::async, asyncCutoff,
+    				     pair.first,
+    				     pair.second));
     }
+    
     // Get result
     for ( auto &fut : futures )
     {
-	nb_contact += fut.get();
+    	nbContactFrame += fut.get();
     }
-
-    // for (size_t i = 0; i < refSize_; ++i)
-    // {
-    //     for (size_t j = 0; j < selSize_; ++j)
-    //     {
-    // 	SelectionPosition p = refsel.position(i);
-    // 	SelectionPosition q = sel.position(j);
-    // 	if ( distance2(p.x(), q.x()) < cutoff_)
-    // 	{
-    // 	    contactMatrix_.at(refSize_*i+j) += 1;
-    // 	    nb_contact++;
-    // 	}
-    //     }
-    // }
-	
-    dh.setPoint(0, nb_contact);
-    nb_total_contact_ += nb_contact;
+    nbTotalContact_ += nbContactFrame;
+    
+    dh.setPoint(0, nbContactFrame);
     dh.finishFrame();
 }
 
@@ -246,19 +294,28 @@ AnalysisTemplate::finishAnalysis(int nframes)
 void
 AnalysisTemplate::writeOutput()
 {
-    // Write tjhe output contact matrix
-    outputStream_.open("contact_matrix.dat");
-    for (size_t i = 0; i < refSize_; ++i)
-    { 
-   	for (size_t j = 0; j < selSize_; ++j)
-   	{
-   	    outputStream_ << std::setw(6)
-   			  << 1.0*contactMatrix_.at(refSize_*i+j)/nb_total_contact_ << " "; 
-   	}
-   	outputStream_ << "\n";
+    // Write the output contact matrix
+    if (!fnMat_.empty())
+    {
+	outputStream_.open(fnMat_);
+	// First line is matrix size N M and the total number of contact
+	outputStream_ << "# "
+		      << refSize_ << " "
+		      << selSize_ << " "
+		      << nbTotalContact_ << "\n";
+	
+	for (size_t i = 0; i < refSize_; ++i)
+	{ 
+	    for (size_t j = 0; j < selSize_; ++j)
+	    {
+		outputStream_ << std::setw(6)
+			      << contactMatrix_.at(refSize_*i+j) << " "; 
+	    }
+	    outputStream_ << "\n";
+	}
+	outputStream_.flush();
+	outputStream_.close();
     }
-    outputStream_.flush();
-    outputStream_.close();
 }
 
 /*! \brief
