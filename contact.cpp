@@ -93,7 +93,7 @@ AnalysisTemplate::AnalysisTemplate()
     : cutoff_(1.0)
 {
     registerAnalysisDataset(&data_, "avedist");
-    cutoff_ *= cutoff_;
+    // cutoff_ *= cutoff_;
 }
 
 
@@ -222,14 +222,14 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     dh.startFrame(frnr, fr.time);
     
     // Lambda function that finds contact between two set of atoms
-    auto distCutoff = [&] (int k, int l) -> bool {
+    auto isInContact = [&] (int k, int l) -> bool {
     	for (auto &refAtomId : refIdMap_.at(k) )
     	{
     	    for (auto &selAtomId : selIdMap_.at(l) )
     	    {
     		SelectionPosition p = refsel.position(refAtomId);
     		SelectionPosition q = sel.position(selAtomId);
-    		if ( distance2(p.x(), q.x()) < cutoff_ )
+    		if ( sqrt(distance2(p.x(), q.x())) < cutoff_ )
     		{
     		    contactMatrix_.at(selSize_*k+l) += 1;
     		    return true;
@@ -239,14 +239,14 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     	return false;
     };
 
-    // Make loop over references residue async to speed up the analysis
-    auto asyncCutoff = [&] (int start, int stop) -> int {
+    // Lambda Function that loops over residues pair and find contacts
+    auto residueContactSearch = [&] (int start, int stop) -> int {
     	int count = 0;
     	for (int i = start; i < stop; ++i)
     	{
     	    for (size_t j = 0; j < selIdMap_.size(); ++j)
     	    {
-    		if ( distCutoff(i, j) )
+    		if ( isInContact(i, j) )
     		{
     		    count++;
     		}
@@ -258,7 +258,7 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     // Determine the size of chunks for Async calculation
     unsigned int n = std::thread::hardware_concurrency();
     int chunksize = refSize_ / n;
-    std::vector<std::pair<int, int>> startstop;
+    std::vector<std::pair<int, int>> chunks;
     int start = 0;
     for (unsigned int k = 0; k < n; k++ )
     {
@@ -267,16 +267,19 @@ AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
     	{
     	    last -= 1;
     	}
-    	startstop.push_back(std::pair<int, int>(start, last));
-    	start = last + 1;
+    	chunks.push_back(std::pair<int, int>(start, last));
+    	start = last;
     }
-    // Launch Futures
+    chunks.back().second = refSize_; // Make sure the last chunk goes to the end of the list
+    
+    // Launch Futures Async for Concurent calc
     std::vector<std::future<int>> futures{};
-    for ( auto& pair : startstop )
+    for ( auto& chunk : chunks )
     {
-    	futures.push_back(std::async(std::launch::async, asyncCutoff,
-    				     pair.first,
-    				     pair.second));
+    	futures.push_back(std::async(std::launch::async,
+				     residueContactSearch,
+    				     chunk.first,
+    				     chunk.second));
     }
     // Get result
     for ( auto &fut : futures )

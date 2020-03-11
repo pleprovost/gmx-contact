@@ -13,6 +13,17 @@ if __name__ == "__main__":
     data = np.loadtxt(filename, comments=["#"])
     print(data.shape)
 
+    sumx = []
+    sumy = []
+    for threshold in range(1000):
+        sumx.append((np.sum(data, axis=0) > 100*threshold ).sum())
+        sumy.append((np.sum(data, axis=1) > 100*threshold ).sum())
+        
+    print(' max : {} , min {} '.format(data.max(), data.min()))
+
+    # plt.plot(sumx)
+    # plt.plot(sumy)   
+    
     plt.imshow(data, interpolation='nearest', cmap=plt.cm.viridis)
                #               norm=colors.PowerNorm(gamma=0.5))
     plt.colorbar()
